@@ -1,0 +1,6 @@
+CONFIDENTIAL TEST DOCUMENT
+
+Project codename: MCPGuard
+Environment: Development
+
+This file represents private organizational data.
