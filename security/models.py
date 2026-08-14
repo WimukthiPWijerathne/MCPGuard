@@ -22,6 +22,13 @@ class RiskLevel(str, Enum):
     CRITICAL = "CRITICAL"
 
 
+class ResourceSensitivity(str, Enum):
+    PUBLIC = "PUBLIC"
+    PRIVATE = "PRIVATE"
+    SECRET = "SECRET"
+    OUTSIDE_SANDBOX = "OUTSIDE_SANDBOX"
+
+
 @dataclass
 class User:
     user_id: str
