@@ -29,6 +29,11 @@ class ResourceSensitivity(str, Enum):
     OUTSIDE_SANDBOX = "OUTSIDE_SANDBOX"
 
 
+class ResponseAction(str, Enum):
+    PASS = "PASS"
+    REDACT = "REDACT"
+
+
 @dataclass
 class User:
     user_id: str

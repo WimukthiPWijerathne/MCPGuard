@@ -1,6 +1,6 @@
 from pathlib import Path
 from typing import Any
-
+from .secrets import redact_secrets
 from mcp_servers.vulnerable_filesystem import server as vulnerable_server
 
 from .audit import write_audit_event
@@ -92,6 +92,30 @@ class MCPGuard:
             risk_level=self._risk_level(risk_score),
             reason=f"authorized tool: {tool_name}",
         )
+    def _inspect_response(
+        self,
+        result: Any,
+    ) -> Any:
+        """
+        Inspect an MCP tool response for secrets.
+
+        V1 supports text responses.
+        """
+
+        if not isinstance(result, str):
+            return result
+
+        sanitized, findings = redact_secrets(result)
+
+        if findings:
+            print(
+                "[MCPGuard] Secret detected in tool response:"
+                f" {', '.join(findings)}"
+            )
+
+            return sanitized
+
+        return result
 
     def call_tool(
         self,
@@ -313,9 +337,15 @@ class MCPGuard:
             )
 
             raise
+        
+        # -------------------------------------------------------------
+        # STEP 7: Inspect tool response
+        # -------------------------------------------------------------
+
+        sanitized_result = self._inspect_response(result)
 
         # ---------------------------------------------------------
-        # STEP 7: Audit successful execution
+        # STEP 8: Audit successful execution
         # ---------------------------------------------------------
 
         self._audit(
@@ -324,7 +354,7 @@ class MCPGuard:
             decision=decision,
         )
 
-        return result
+        return sanitized_result
 
     # =============================================================
     # VALIDATION
