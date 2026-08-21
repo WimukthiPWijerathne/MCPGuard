@@ -1,13 +1,17 @@
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
-
+from pydantic import BaseModel
 
 class Role(str, Enum):
     VIEWER = "viewer"
     DEVELOPER = "developer"
     ADMIN = "admin"
 
+
+class UserContext(BaseModel):
+    user_id: str
+    role: Role
 
 class Decision(str, Enum):
     ALLOW = "ALLOW"
@@ -21,7 +25,11 @@ class RiskLevel(str, Enum):
     HIGH = "HIGH"
     CRITICAL = "CRITICAL"
 
-
+class PolicyDecision(str, Enum):
+    ALLOW = "ALLOW"
+    ALLOW_WITH_AUDIT = "ALLOW_WITH_AUDIT"
+    REQUIRE_APPROVAL = "REQUIRE_APPROVAL"
+    BLOCK = "BLOCK"
 class ResourceSensitivity(str, Enum):
     PUBLIC = "PUBLIC"
     PRIVATE = "PRIVATE"

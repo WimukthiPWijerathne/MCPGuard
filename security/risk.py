@@ -1,21 +1,16 @@
+# security/risk.py
 from dataclasses import dataclass
-from typing import Any
-
-from .models import ResourceSensitivity, RiskLevel, Role
-
+from security.models import Role
 
 @dataclass
 class RiskAssessment:
     score: int
-    level: RiskLevel
+    level: str
+    decision: str
     reasons: list[str]
 
-
-# ------------------------------------------------------------
-# Base risk by tool
-# ------------------------------------------------------------
-
-TOOL_RISK = {
+# Base tool risks
+TOOL_RISK_SCORES: dict[str, int] = {
     "list_files": 10,
     "read_file": 20,
     "create_file": 40,
@@ -23,142 +18,60 @@ TOOL_RISK = {
     "delete_file": 80,
 }
 
+class RiskEngine:
+    @staticmethod
+    def calculate(
+        tool: str,
+        role: Role,
+        path: str | None = None,
+        resource_classification: str = "PUBLIC",
+    ) -> RiskAssessment:
+        reasons: list[str] = []
+        score = TOOL_RISK_SCORES.get(tool, 50)
+        reasons.append(f"Base tool risk for '{tool}': {score}")
 
-# ------------------------------------------------------------
-# Additional risk by resource sensitivity
-# ------------------------------------------------------------
+        # 1. Resource Sensitivity Modifier
+        if resource_classification == "SECRET":
+            score += 50
+            reasons.append("Target is a classified SECRET resource (+50)")
+        elif resource_classification == "PRIVATE":
+            score += 20
+            reasons.append("Target is a classified PRIVATE resource (+20)")
 
-RESOURCE_RISK = {
-    ResourceSensitivity.PUBLIC: 0,
-    ResourceSensitivity.PRIVATE: 20,
-    ResourceSensitivity.SECRET: 50,
-    ResourceSensitivity.OUTSIDE_SANDBOX: 100,
-}
+        # 2. Path Traversal & Suspicious Argument Flags
+        if path:
+            if ".." in path:
+                score += 40
+                reasons.append("Suspicious relative path detected (+40)")
+            if any(p in path.lower() for p in [".env", "id_rsa", "password", "token"]):
+                score += 30
+                reasons.append("Sensitive file name keyword matched (+30)")
 
+        # 3. Role-based Context Modifiers
+        if role == Role.VIEWER and tool in ["create_file", "write_file", "delete_file"]:
+            score += 40
+            reasons.append("Write/Delete action attempted under Viewer role (+40)")
 
-# ------------------------------------------------------------
-# Role/context modifiers
-# ------------------------------------------------------------
+        # Cap score between 0 and 100
+        final_score = max(0, min(100, score))
 
-ROLE_MODIFIER = {
-    Role.VIEWER: 0,
-    Role.DEVELOPER: 0,
-    Role.ADMIN: -10,
-}
+        # Determine Decision and Level based on V1 Scope
+        if final_score <= 30:
+            level = "LOW"
+            decision = "ALLOW"
+        elif final_score <= 60:
+            level = "MEDIUM"
+            decision = "ALLOW_WITH_AUDIT"
+        elif final_score <= 80:
+            level = "HIGH"
+            decision = "REQUIRE_APPROVAL"
+        else:
+            level = "CRITICAL"
+            decision = "BLOCK"
 
-
-def calculate_risk(
-    *,
-    tool_name: str,
-    role: Role,
-    resource: ResourceSensitivity | None = None,
-    arguments: dict[str, Any] | None = None,
-) -> RiskAssessment:
-
-    arguments = arguments or {}
-
-    score = TOOL_RISK.get(tool_name, 100)
-    reasons: list[str] = []
-
-    reasons.append(
-        f"base tool risk={score}"
-    )
-
-    # --------------------------------------------------------
-    # Resource sensitivity
-    # --------------------------------------------------------
-
-    if resource is not None:
-
-        resource_modifier = RESOURCE_RISK[resource]
-
-        score += resource_modifier
-
-        if resource_modifier > 0:
-            reasons.append(
-                f"resource sensitivity +{resource_modifier}"
-            )
-
-    # --------------------------------------------------------
-    # Role
-    # --------------------------------------------------------
-
-    role_modifier = ROLE_MODIFIER[role]
-
-    if role_modifier != 0:
-
-        score += role_modifier
-
-        reasons.append(
-            f"role modifier {role_modifier}"
+        return RiskAssessment(
+            score=final_score,
+            level=level,
+            decision=decision,
+            reasons=reasons,
         )
-
-    # --------------------------------------------------------
-    # Destructive operation
-    # --------------------------------------------------------
-
-    if tool_name == "delete_file":
-
-        score += 10
-
-        reasons.append(
-            "destructive operation +10"
-        )
-
-    # --------------------------------------------------------
-    # Large content modification
-    # --------------------------------------------------------
-
-    content = arguments.get("content")
-
-    if isinstance(content, str):
-
-        if len(content) > 10_000:
-
-            score += 10
-
-            reasons.append(
-                "large content payload +10"
-            )
-
-    # --------------------------------------------------------
-    # Suspicious path characteristics
-    # --------------------------------------------------------
-
-    path = arguments.get("path")
-
-    if isinstance(path, str):
-
-        if ".." in path:
-
-            score += 30
-
-            reasons.append(
-                "parent-directory reference +30"
-            )
-
-    # --------------------------------------------------------
-    # Clamp score
-    # --------------------------------------------------------
-
-    score = max(0, min(score, 100))
-
-    return RiskAssessment(
-        score=score,
-        level=_risk_level(score),
-        reasons=reasons,
-    )
-
-
-def _risk_level(score: int) -> RiskLevel:
-
-    if score <= 30:
-        return RiskLevel.LOW
-
-    if score <= 60:
-        return RiskLevel.MEDIUM
-
-    if score <= 80:
-        return RiskLevel.HIGH
-
-    return RiskLevel.CRITICAL

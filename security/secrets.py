@@ -7,20 +7,43 @@ import re
 
 SECRET_PATTERNS = {
     "API_KEY": re.compile(
-        r"(?i)(api[_-]?key\s*[:=]\s*)([A-Za-z0-9_\-]{8,})"
+        r"((?:API_KEY|apikey|secret|token)\s*=\s*)([^\r\n]+)",
+        re.IGNORECASE,
     ),
     "PASSWORD": re.compile(
-        r"(?i)(password\s*[:=]\s*)([^\s]+)"
+        r"((?:DATABASE_PASSWORD|PASSWORD|passwd|pwd)\s*=\s*)([^\r\n]+)",
+        re.IGNORECASE,
     ),
     "TOKEN": re.compile(
         r"(?i)(token\s*[:=]\s*)([A-Za-z0-9_\-\.]{8,})"
     ),
     "PRIVATE_KEY": re.compile(
-        r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----",
-        re.DOTALL,
+        r"-----BEGIN (?:RSA )?PRIVATE KEY-----[\s\S]*?-----END (?:RSA )?PRIVATE KEY-----",
+        re.IGNORECASE,
     ),
 }
+class ResponseScanner:
+    @staticmethod
+    def scan(content: str) -> tuple[str, list[str]]:
+        """
+        Scans response text for secret patterns and replaces them with redaction markers.
+        Returns: (sanitized_content, detected_types)
+        """
+        if not isinstance(content, str):
+            return content, []
 
+        detected: list[str] = []
+        sanitized = content
+
+        for secret_type, pattern in SECRET_PATTERNS.items():
+            if pattern.search(sanitized):
+                detected.append(secret_type)
+                if secret_type in ["API_KEY", "PASSWORD"]:
+                    sanitized = pattern.sub(r"\g<1>[REDACTED]", sanitized)
+                else:
+                    sanitized = pattern.sub("[REDACTED]", sanitized)
+
+        return sanitized, detected
 
 def detect_secrets(text: str) -> list[str]:
     """

@@ -1,536 +1,183 @@
+# security/gateway.py
+import datetime
+import json
 from pathlib import Path
 from typing import Any
-from .secrets import redact_secrets
-from mcp_servers.vulnerable_filesystem import server as vulnerable_server
 
-from .audit import write_audit_event
-from .models import (
-    Decision,
-    ResourceSensitivity,
-    RiskLevel,
-    SecurityDecision,
-    User,
-)
-from .policy import is_authorized
-from .resources import classify_path
-
+from mcp import Client
+from security.models import UserContext, PolicyDecision
+from security.risk import RiskEngine
+from security.rate_limit import RateLimiter
+from security.secrets import ResponseScanner
+from security.approval import ApprovalManager
+from security.injection import PromptInjectionDetector
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-LAB_ROOT = (PROJECT_ROOT / "sandbox").resolve()
-
+LOG_FILE = PROJECT_ROOT / "logs" / "security_events.jsonl"
 
 class MCPGuard:
-    """
-    MCPGuard V1 security gateway.
-
-    Current security controls:
-        1. Role-based authorization
-        2. Argument validation
-        3. Path validation
-        4. Resource classification
-        5. Secret-resource protection
-        6. Audit logging
-    """
-
-    def __init__(self, user: User):
-        self.user = user
-
-    def authorize(self, tool_name: str) -> SecurityDecision:
-        """
-        Check whether the user is allowed to use the tool.
-        """
-
-        try:
-            allowed = is_authorized(
-                self.user.role,
-                tool_name,
-            )
-
-        except ValueError as exc:
-
-            decision = SecurityDecision(
-                decision=Decision.BLOCK,
-                risk_score=100,
-                risk_level=RiskLevel.CRITICAL,
-                reason=str(exc),
-            )
-
-            self._audit(
-                tool_name=tool_name,
-                arguments={},
-                decision=decision,
-            )
-
-            return decision
-
-        if not allowed:
-
-            decision = SecurityDecision(
-                decision=Decision.BLOCK,
-                risk_score=90,
-                risk_level=RiskLevel.CRITICAL,
-                reason=(
-                    f"user '{self.user.user_id}' with role "
-                    f"'{self.user.role.value}' is not authorized "
-                    f"to execute '{tool_name}'"
-                ),
-            )
-
-            self._audit(
-                tool_name=tool_name,
-                arguments={},
-                decision=decision,
-            )
-
-            return decision
-
-        risk_score = self._base_risk(tool_name)
-
-        return SecurityDecision(
-            decision=Decision.ALLOW,
-            risk_score=risk_score,
-            risk_level=self._risk_level(risk_score),
-            reason=f"authorized tool: {tool_name}",
-        )
-    def _inspect_response(
-        self,
-        result: Any,
-    ) -> Any:
-        """
-        Inspect an MCP tool response for secrets.
-
-        V1 supports text responses.
-        """
-
-        if not isinstance(result, str):
-            return result
-
-        sanitized, findings = redact_secrets(result)
-
-        if findings:
-            print(
-                "[MCPGuard] Secret detected in tool response:"
-                f" {', '.join(findings)}"
-            )
-
-            return sanitized
-
-        return result
-
-    def call_tool(
-        self,
-        tool_name: str,
-        arguments: dict[str, Any] | None = None,
-    ) -> Any:
-        """
-        Main MCPGuard security entry point.
-        """
-
-        arguments = arguments or {}
-
-        # ---------------------------------------------------------
-        # STEP 1: Authorization
-        # ---------------------------------------------------------
-
-        decision = self.authorize(tool_name)
-
-        if decision.decision == Decision.BLOCK:
-
-            self._audit(
-                tool_name=tool_name,
-                arguments=arguments,
-                decision=decision,
-            )
-
-            raise PermissionError(decision.reason)
-
-        # ---------------------------------------------------------
-        # STEP 2: Argument validation
-        # ---------------------------------------------------------
-
-        try:
-            self._validate_arguments(
-                tool_name,
-                arguments,
-            )
-        except (ValueError, TypeError) as exc:
-
-            decision = SecurityDecision(
-                decision=Decision.BLOCK,
-                risk_score=95,
-                risk_level=RiskLevel.CRITICAL,
-                reason=str(exc),
-            )
-
-            self._audit(
-                tool_name=tool_name,
-                arguments=arguments,
-                decision=decision,
-            )
-
-            raise
-
-        # ---------------------------------------------------------
-        # STEP 3: Path validation
-        # ---------------------------------------------------------
-
-        if "path" in arguments:
-
-            try:
-                self._validate_path(
-                    arguments["path"]
-                )
-
-            except PermissionError as exc:
-
-                decision = SecurityDecision(
-                    decision=Decision.BLOCK,
-                    risk_score=100,
-                    risk_level=RiskLevel.CRITICAL,
-                    reason=str(exc),
-                )
-
-                self._audit(
-                    tool_name=tool_name,
-                    arguments=arguments,
-                    decision=decision,
-                )
-
-                raise
-
-        # ---------------------------------------------------------
-        # STEP 4: Resource classification
-        # ---------------------------------------------------------
-
-        resource = None
-
-        if "path" in arguments:
-
-            resource = classify_path(
-                arguments["path"]
-            )
-
-            # Outside sandbox should never be allowed.
-            if resource == ResourceSensitivity.OUTSIDE_SANDBOX:
-
-                decision = SecurityDecision(
-                    decision=Decision.BLOCK,
-                    risk_score=100,
-                    risk_level=RiskLevel.CRITICAL,
-                    reason="resource is outside the sandbox",
-                    metadata={
-                        "resource": resource.value,
-                    },
-                )
-
-                self._audit(
-                    tool_name=tool_name,
-                    arguments=arguments,
-                    decision=decision,
-                )
-
-                raise PermissionError(
-                    decision.reason
-                )
-
-            # Secret resources are blocked in V1.
-            if resource == ResourceSensitivity.SECRET:
-
-                decision = SecurityDecision(
-                    decision=Decision.BLOCK,
-                    risk_score=100,
-                    risk_level=RiskLevel.CRITICAL,
-                    reason="access to secret resources is blocked",
-                    metadata={
-                        "resource": resource.value,
-                    },
-                )
-
-                self._audit(
-                    tool_name=tool_name,
-                    arguments=arguments,
-                    decision=decision,
-                )
-
-                raise PermissionError(
-                    decision.reason
-                )
-
-        # ---------------------------------------------------------
-        # STEP 5: Adjust risk according to resource
-        # ---------------------------------------------------------
-
-        risk_score = decision.risk_score
-
-        if resource == ResourceSensitivity.PRIVATE:
-            risk_score += 20
-
-        risk_score = min(risk_score, 100)
-
-        decision = SecurityDecision(
-            decision=Decision.ALLOW,
-            risk_score=risk_score,
-            risk_level=self._risk_level(risk_score),
-            reason=(
-                f"authorized access to "
-                f"{resource.value.lower()}"
-                if resource
-                else "authorized tool execution"
-            ),
-            metadata={
-                "resource": resource.value
-                if resource
-                else None
-            },
-        )
-
-        # ---------------------------------------------------------
-        # STEP 6: Execute
-        # ---------------------------------------------------------
-
-        tool_function = getattr(
-            vulnerable_server,
-            tool_name,
-            None,
-        )
-
-        if tool_function is None:
-
-            failure = SecurityDecision(
-                decision=Decision.BLOCK,
-                risk_score=100,
-                risk_level=RiskLevel.CRITICAL,
-                reason=(
-                    f"Tool '{tool_name}' does not exist."
-                ),
-            )
-
-            self._audit(
-                tool_name=tool_name,
-                arguments=arguments,
-                decision=failure,
-            )
-
-            raise ValueError(
-                failure.reason
-            )
-
-        try:
-
-            result = tool_function(
-                **arguments
-            )
-
-        except Exception as exc:
-
-            failure = SecurityDecision(
-                decision=Decision.BLOCK,
-                risk_score=100,
-                risk_level=RiskLevel.CRITICAL,
-                reason=f"tool execution failed: {exc}",
-            )
-
-            self._audit(
-                tool_name=tool_name,
-                arguments=arguments,
-                decision=failure,
-            )
-
-            raise
+    def __init__(self, mcp_server_instance: Any, lab_root: Path, workspace_root: Path):
+        self.server = mcp_server_instance
+        self.lab_root = lab_root.resolve()
+        self.workspace_root = workspace_root.resolve()
+        self.rate_limiter = RateLimiter(max_requests=5, window_seconds=10)
         
-        # -------------------------------------------------------------
-        # STEP 7: Inspect tool response
-        # -------------------------------------------------------------
+        LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
 
-        sanitized_result = self._inspect_response(result)
+    def _log_event(self, event: dict) -> None:
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(event) + "\n")
 
-        # ---------------------------------------------------------
-        # STEP 8: Audit successful execution
-        # ---------------------------------------------------------
-
-        self._audit(
-            tool_name=tool_name,
-            arguments=arguments,
-            decision=decision,
-        )
-
-        return sanitized_result
-
-    # =============================================================
-    # VALIDATION
-    # =============================================================
-
-    def _validate_arguments(
-        self,
-        tool_name: str,
-        arguments: dict[str, Any],
-    ) -> None:
-
-        allowed_tools = {
-            "list_files",
-            "read_file",
-            "create_file",
-            "write_file",
-            "delete_file",
-        }
-
-        if tool_name not in allowed_tools:
-            raise ValueError(
-                f"Unsupported tool: {tool_name}"
-            )
-
-        if tool_name == "list_files":
-
-            if arguments:
-                raise ValueError(
-                    "list_files() does not accept arguments."
-                )
-
-        if tool_name in {
-            "read_file",
-            "delete_file",
-        }:
-
-            if "path" not in arguments:
-                raise ValueError(
-                    f"{tool_name} requires 'path'."
-                )
-
-            if not isinstance(
-                arguments["path"],
-                str,
-            ):
-                raise TypeError(
-                    "'path' must be a string."
-                )
-
-        if tool_name in {
-            "create_file",
-            "write_file",
-        }:
-
-            if "path" not in arguments:
-                raise ValueError(
-                    f"{tool_name} requires 'path'."
-                )
-
-            if "content" not in arguments:
-                raise ValueError(
-                    f"{tool_name} requires 'content'."
-                )
-
-            if not isinstance(
-                arguments["path"],
-                str,
-            ):
-                raise TypeError(
-                    "'path' must be a string."
-                )
-
-            if not isinstance(
-                arguments["content"],
-                str,
-            ):
-                raise TypeError(
-                    "'content' must be a string."
-                )
-
-    def _validate_path(
-        self,
-        user_path: str,
-    ) -> None:
-
-        if not user_path.strip():
-            raise ValueError(
-                "Path cannot be empty."
-            )
-
-        candidate = (
-            LAB_ROOT / user_path
-        ).resolve()
+    def _classify_path(self, raw_path: str | None) -> tuple[str, str | None]:
+        if not raw_path:
+            return "PUBLIC", None
 
         try:
+            target = (self.workspace_root / raw_path).resolve()
+        except Exception:
+            return "OUTSIDE_SANDBOX", None
 
-            candidate.relative_to(
-                LAB_ROOT
-            )
+        if not target.is_relative_to(self.lab_root):
+            return "OUTSIDE_SANDBOX", str(target)
 
-        except ValueError:
+        relative = target.relative_to(self.lab_root)
+        parts = relative.parts
 
-            raise PermissionError(
-                f"Path traversal detected: "
-                f"{user_path}"
-            )
+        if len(parts) > 0 and parts[0] == "secrets":
+            return "SECRET", str(target)
+        elif len(parts) > 0 and parts[0] == "private":
+            return "PRIVATE", str(target)
 
-    # =============================================================
-    # RISK
-    # =============================================================
+        return "PUBLIC", str(target)
 
-    @staticmethod
-    def _base_risk(
-        tool_name: str,
-    ) -> int:
+    async def call_tool(self, user: UserContext, tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        timestamp = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        path_arg = arguments.get("path")
 
-        risk = {
-            "list_files": 10,
-            "read_file": 20,
-            "create_file": 40,
-            "write_file": 60,
-            "delete_file": 80,
-        }
+        # 1. Rate Limiting Check (T07)
+        allowed, rate_msg = self.rate_limiter.check(user.user_id, tool_name)
+        if not allowed:
+            self._log_event({
+                "timestamp": timestamp,
+                "user_id": user.user_id,
+                "role": user.role.value,
+                "tool": tool_name,
+                "arguments": arguments,
+                "decision": PolicyDecision.BLOCK.value,
+                "risk_score": 85,
+                "reason": rate_msg
+            })
+            return {"status": "BLOCKED", "error": rate_msg, "risk_score": 85}
 
-        return risk.get(
-            tool_name,
-            100,
-        )
+        # 2. Resource Boundary Check (T02, T03)
+        classification, resolved_path = self._classify_path(path_arg)
+        if classification == "OUTSIDE_SANDBOX":
+            reason = f"Path traversal blocked: outside sandbox boundary ({path_arg})"
+            self._log_event({
+                "timestamp": timestamp,
+                "user_id": user.user_id,
+                "role": user.role.value,
+                "tool": tool_name,
+                "arguments": arguments,
+                "decision": PolicyDecision.BLOCK.value,
+                "risk_score": 100,
+                "reason": reason
+            })
+            return {"status": "BLOCKED", "error": reason, "risk_score": 100}
 
-    @staticmethod
-    def _risk_level(
-        score: int,
-    ) -> RiskLevel:
-
-        if score <= 30:
-            return RiskLevel.LOW
-
-        if score <= 60:
-            return RiskLevel.MEDIUM
-
-        if score <= 80:
-            return RiskLevel.HIGH
-
-        return RiskLevel.CRITICAL
-
-    # =============================================================
-    # AUDIT
-    # =============================================================
-
-    def _audit(
-        self,
-        *,
-        tool_name: str,
-        arguments: dict[str, Any],
-        decision: SecurityDecision,
-    ) -> None:
-
-        write_audit_event(
-            user_id=self.user.user_id,
-            role=self.user.role.value,
+        # 3. Contextual Risk Assessment
+        risk_assessment = RiskEngine.calculate(
             tool=tool_name,
-            arguments=arguments,
-            decision=decision.decision.value,
-            risk_score=decision.risk_score,
-            risk_level=decision.risk_level.value,
-            reason=decision.reason,
+            role=user.role,
+            path=path_arg,
+            resource_classification=classification
         )
 
+        # 4. Enforce Policy Block
+        if risk_assessment.decision == PolicyDecision.BLOCK.value:
+            reason = f"Policy violation: {'; '.join(risk_assessment.reasons)}"
+            self._log_event({
+                "timestamp": timestamp,
+                "user_id": user.user_id,
+                "role": user.role.value,
+                "tool": tool_name,
+                "arguments": arguments,
+                "decision": PolicyDecision.BLOCK.value,
+                "risk_score": risk_assessment.score,
+                "reason": reason
+            })
+            return {"status": "BLOCKED", "error": reason, "risk_score": risk_assessment.score}
 
+        # 5. Human Approval Check (T06)
+        if risk_assessment.decision == PolicyDecision.REQUIRE_APPROVAL.value:
+            approved = ApprovalManager.prompt_approval(
+                user_id=user.user_id,
+                tool=tool_name,
+                arguments=arguments,
+                risk_score=risk_assessment.score
+            )
+            if not approved:
+                reason = "Destructive operation rejected by administrator"
+                self._log_event({
+                    "timestamp": timestamp,
+                    "user_id": user.user_id,
+                    "role": user.role.value,
+                    "tool": tool_name,
+                    "arguments": arguments,
+                    "decision": PolicyDecision.BLOCK.value,
+                    "risk_score": risk_assessment.score,
+                    "reason": reason
+                })
+                return {"status": "BLOCKED", "error": reason, "risk_score": risk_assessment.score}
 
-"""
-read_file("secrets/credentials.txt")
-             ↓
-       classify_path()
-             ↓
-          SECRET
-             ↓
-           BLOCK
-"""
+        # 6. Server Execution
+        async with Client(self.server) as client:
+            raw_result = await client.call_tool(tool_name, arguments)
+            raw_content = str(raw_result.structured_content if hasattr(raw_result, 'structured_content') else raw_result)
+
+        # 7. Prompt Injection Inspection (T04)
+        is_injection, injection_msg = PromptInjectionDetector.inspect(raw_content)
+        if is_injection:
+            quarantine_text = f"[MCPGuard Quarantine]: Response blocked. {injection_msg}"
+            self._log_event({
+                "timestamp": timestamp,
+                "user_id": user.user_id,
+                "role": user.role.value,
+                "tool": tool_name,
+                "arguments": arguments,
+                "decision": "FLAG_INJECTION",
+                "risk_score": 90,
+                "reason": injection_msg
+            })
+            return {
+                "status": "FLAGGED_INJECTION",
+                "decision": "QUARANTINED",
+                "risk_score": 90,
+                "result": quarantine_text,
+                "warning": injection_msg
+            }
+
+        # 8. Secret Redaction (T05)
+        sanitized_content, detected_secrets = ResponseScanner.scan(raw_content)
+
+        # 9. Log Successful Event
+        self._log_event({
+            "timestamp": timestamp,
+            "user_id": user.user_id,
+            "role": user.role.value,
+            "tool": tool_name,
+            "arguments": arguments,
+            "decision": risk_assessment.decision,
+            "risk_score": risk_assessment.score,
+            "secret_detected": len(detected_secrets) > 0,
+            "redacted_types": detected_secrets,
+            "reason": "Authorized execution completed"
+        })
+
+        return {
+            "status": "SUCCESS",
+            "decision": risk_assessment.decision,
+            "risk_score": risk_assessment.score,
+            "result": sanitized_content,
+            "secrets_redacted": detected_secrets
+        }
